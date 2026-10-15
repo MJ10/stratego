@@ -1,22 +1,80 @@
-[build-system]
-requires = ["setuptools", "setuptools-scm"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "ataraxos"
+version = "0.1.0"
+description = "Self-play reinforcement learning and search for Stratego"
 readme = "README.md"
-requires-python = ">= 3.10"
-license = {text = "MIT license"}
-classifiers = [
-    "Programming Language :: Python :: 3",
+license = { text = "MIT license" }
+requires-python = ">=3.11"
+dependencies = [
+    "jax[cuda12]>=0.5.0; sys_platform == 'linux'",
+    "jax>=0.5.0; sys_platform != 'linux'",
+    "flax>=0.10.0",
+    "optax>=0.2.0",
+    "numpy",
 ]
-dynamic = ["version"]
 
-[tool.setuptools]
-packages = ["pyengine"]
+[dependency-groups]
+dev = ["pytest"]
 
-[tool.ruff]
-line-length = 100
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
 
-[tool.black]
-line-length = 100
+[tool.setuptools.packages.find]
+include = ["pyengine*", "jax_stratego*"]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.cluv]
+job_script_path = "scripts/job.sh"
+project_dir = "$SCRATCH/stratego"
+results_path = "$SCRATCH/logs/stratego"
+results_symlink = "logs"
+
+[tool.cluv.local]
+env = { SCRATCH = "$HOME/scratch" }
+
+[tool.cluv.env]
+UV_OFFLINE = "1"
+WANDB_MODE = "offline"
+
+[tool.cluv.sbatch_args]
+nodes = 1
+ntasks = 1
+cpus-per-task = 8
+mem = "48G"
+time = "1:00:00"
+
+[tool.cluv.clusters.mila]
+env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
+sbatch_args = { partition = "main", gpus-per-node = "a100l:1", cpus-per-task = 8, mem = "48G" }
+
+[tool.cluv.clusters.fir]
+env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
+sbatch_args = [
+    { account = "rrg-bengioy-ad_gpu", partition = "gpubase_bygpu_b2", gpus-per-node = "h100:1", cpus-per-task = 8, mem = "64G" },
+    { account = "def-bengioy_gpu", partition = "gpubase_bygpu_b2", gpus-per-node = "h100:1", cpus-per-task = 8, mem = "64G" },
+]
+
+[tool.cluv.clusters.rorqual]
+sbatch_args = [
+    { account = "rrg-bengioy-ad_gpu", partition = "gpubase_bygpu_b1", gpus-per-node = "h100:1", cpus-per-task = 8, mem = "64G" },
+    { account = "def-bengioy_gpu", partition = "gpubase_bygpu_b1", gpus-per-node = "h100:1", cpus-per-task = 8, mem = "64G" },
+]
+
+[tool.cluv.clusters.nibi]
+env = { UV_OFFLINE = "0", WANDB_MODE = "online" }
+sbatch_args = [
+    { account = "rrg-bengioy-ad", gpus-per-node = "1", cpus-per-task = 8, mem = "64G" },
+    { account = "def-bengioy", gpus-per-node = "1", cpus-per-task = 8, mem = "64G" },
+]
+
+[tool.cluv.clusters.tamia]
+sbatch_args = { account = "aip-bengioy", partition = "gpubase_bynode_b2", gpus-per-node = "h100:4" }

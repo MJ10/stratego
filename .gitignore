@@ -13,3 +13,6 @@ local*
 checkpoints*
 run.sh
 set_env.sh
+*.pdf
+logs
+.uv-cache

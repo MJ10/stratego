@@ -100,6 +100,7 @@ def evaluate_search_vs_policy(
         depth=search_depth,
         max_num_Moves=max_moves,
         max_moves_between_attacks=max_moves_between_attacks,
+        max_unknown=8 if barrage else 40,
     )
 
     vmap_obs = jax.vmap(lambda s: observe(s, max_moves, max_moves_between_attacks))

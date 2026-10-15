@@ -33,6 +33,7 @@ class SearchConfig:
     td_lambda: float = 0.8
     max_num_Moves: int = 400
     max_moves_between_attacks: int = 80
+    max_unknown: int = 8
 
 
 def allocate_rollout_actions(mask: jax.Array, num_rollout_envs: int) -> jax.Array:
@@ -122,8 +123,8 @@ def estimate_q_values(
         val_probs = jax.nn.softmax(val_logp_2, axis=-1)
 
         is_last = d == (num_pairs - 1)
-        lam_d = cfg.td_lambda ** d
-        normalizer = jnp.where(is_last, lam_d, (1.0 - cfg.td_lambda) * lam_d)
+        lam_d = jnp.float32(cfg.td_lambda) ** d.astype(jnp.float32)
+        normalizer = jnp.where(is_last, lam_d, (1.0 - jnp.float32(cfg.td_lambda)) * lam_d)
         target = jnp.where(term[:, None], lam_d * rew_cat, normalizer * val_probs)
 
         leaf_vals = leaf_vals + (~done)[:, None].astype(jnp.float32) * target
@@ -180,7 +181,9 @@ def search_action(
 
     if belief_model is not None:
         pos_oh, _, moved, counts = get_unknown_piece_info(state)
-        sampled_hidden = sample_belief(belief_model, k_bel, R, obs, pos_oh, moved, counts)
+        sampled_hidden = sample_belief(
+            belief_model, k_bel, R, obs, pos_oh, moved, counts, max_unknown=cfg.max_unknown
+        )
         rollout_states = jax.vmap(assign_opponent_hidden_pieces)(tiled_state, sampled_hidden)
     else:
         rollout_states = tiled_state

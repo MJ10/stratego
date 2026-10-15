@@ -210,10 +210,12 @@ def sample_arrangements(
     init_samples = jnp.zeros((n_sample, ARRANGEMENT_SIZE, N_PIECE_TYPE), dtype=jnp.float32)
     step_keys = jax.random.split(key, ARRANGEMENT_SIZE + 1)
     flip_key, step_keys = step_keys[0], step_keys[1:]
+    graphdef, state = nnx.split(model)
 
     def scan_step(samples, idx_and_key):
         t, k = idx_and_key
-        log_pi, v = model(samples)
+        m = nnx.merge(graphdef, state)
+        log_pi, v = m(samples)
         log_pi_t = log_pi[:, t, :]
         v_t = v[:, t]
         sampled_piece = jax.random.categorical(k, log_pi_t, axis=-1)
@@ -364,6 +366,7 @@ def sample_belief(
     unknown_pos_onehot: jax.Array,
     unknown_has_moved: jax.Array,
     unknown_counts: jax.Array,
+    max_unknown: int = ARRANGEMENT_SIZE,
 ) -> jax.Array:
     """Autoregressively sample `n_sample` consistent hidden piece assignments (n_sample, 40, 14)."""
     mem_1 = model.encode(infostate[None, ...], unknown_pos_onehot[None, ...])
@@ -374,11 +377,13 @@ def sample_belief(
     active_slots = jnp.any(unknown_pos_onehot, axis=-1)  # (40,)
 
     init_samples = jnp.zeros((n_sample, ARRANGEMENT_SIZE, N_PIECE_TYPE), dtype=jnp.bool_)
-    step_keys = jax.random.split(key, ARRANGEMENT_SIZE)
+    step_keys = jax.random.split(key, max_unknown)
+    graphdef, state = nnx.split(model)
 
     def scan_step(samples, idx_and_key):
         i, k = idx_and_key
-        logits = model.decode(samples, mem)
+        m = nnx.merge(graphdef, state)
+        logits = m.decode(samples, mem)
         mask = create_belief_mask(counts_B, samples, has_moved_B)
         masked_logits_i = jnp.where(mask[:, i, :], logits[:, i, :], -1e9)
         sampled_piece = jax.random.categorical(k, masked_logits_i, axis=-1)
@@ -387,5 +392,5 @@ def sample_belief(
         samples = samples.at[:, i, :].set(onehot_i)
         return samples, None
 
-    samples, _ = jax.lax.scan(scan_step, init_samples, (jnp.arange(ARRANGEMENT_SIZE), step_keys))
+    samples, _ = jax.lax.scan(scan_step, init_samples, (jnp.arange(max_unknown), step_keys))
     return samples

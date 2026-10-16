@@ -32,7 +32,15 @@ from jax_stratego.networks import (
     sample_belief,
 )
 from jax_stratego.search import SearchConfig, search_action
-from jax_stratego.train import TrainConfig, compute_two_player_gae, create_train_state, make_train_step
+from jax_stratego.train import (
+    TrainConfig,
+    compute_arrangement_prefix_gae,
+    compute_two_player_gae,
+    create_train_state,
+    get_weighted_uniform_policy,
+    make_train_step,
+    power_schedule,
+)
 
 
 def _encode_action(src: int, dst: int) -> int:
@@ -136,7 +144,8 @@ def test_arrangement_and_belief_sampling():
 
     for counts in (BARRAGE_COUNTS, CLASSIC_COUNTS):
         arr_model = ArrangementTransformer(counts, cfg, rngs=rngs)
-        arr_ids, canon_oh, _, _ = sample_arrangements(arr_model, jax.random.PRNGKey(7), n_sample=8)
+        arr_ids, canon_oh, _, _, ent_p = sample_arrangements(arr_model, jax.random.PRNGKey(7), n_sample=8)
+        assert ent_p.shape == (8, 40)
         assert arr_ids.shape == (8, 40)
         # Every sampled arrangement must have exact piece counts matching `counts`
         sampled_counts = jnp.sum(canon_oh.astype(jnp.int32), axis=1)  # (8, 14)
@@ -176,6 +185,8 @@ def test_end_to_end_train_and_search():
         d_model=32,
         n_head=2,
         depth=1,
+        use_bfloat16=True,
+        use_power_schedule=True,
     )
     ts = create_train_state(cfg, jax.random.PRNGKey(0))
     train_step = make_train_step(cfg)
@@ -219,3 +230,41 @@ def test_two_player_gae_exact():
     # Step 0 (Pl0's first move, 1 ply before Pl0's winning move at t=2):
     # delta_0 = 0, delta_2 = 1.0 -> adv[0] = 0 + gae_lambda * 1.0 = 0.5
     assert jnp.isclose(adv[0, 0], 0.5)
+
+
+def test_arrangement_prefix_gae_and_weighted_magnet():
+    """Verify ArrangementBuffer prefix TD/GAE with entropy bonus and piece-weighted magnet policy."""
+    oh = jax.nn.one_hot(jnp.zeros((2, 40), dtype=jnp.int32), 14, dtype=jnp.float32)
+    old_logp = jnp.full((2, 40, 14), -1.0, dtype=jnp.float32)
+    old_val_logp = jnp.zeros((2, 40, 3), dtype=jnp.float32)
+    old_ent = jnp.zeros((2, 40), dtype=jnp.float32)
+    term_cat = jnp.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], dtype=jnp.float32)
+
+    ret, reg_ret, adv = compute_arrangement_prefix_gae(
+        oh, old_logp, old_val_logp, old_ent, term_cat,
+        td_lambda=1.0, gae_lambda=1.0, reg_temp=jnp.float32(0.1), reg_norm=10.0,
+    )
+    # With td_lambda=1.0, every prefix return equals the terminal categorical return
+    assert jnp.allclose(ret[0, 0], jnp.array([0.0, 0.0, 1.0]))
+    # Future accumulated NLL at step 39 is 1.0 -> normalized by reg_norm=10.0 is 0.1; at step 0 is 40/10 = 4.0
+    assert jnp.isclose(reg_ret[0, 39], 0.1)
+    assert jnp.isclose(reg_ret[0, 0], 4.0)
+    # Advantage at step 39 for winner (+1.0) with old_v=0 and reg_temp=0.1 * nll=1.0 is 1.1
+    assert jnp.isclose(adv[0, 39], 1.1)
+
+    # Piece-weighted uniform policy: if cell 30 has 3 legal moves and cell 31 has 1 legal move,
+    # cell 30 and cell 31 each receive 0.5 total probability mass (so cell 31's single move has 0.5,
+    # and each of cell 30's 3 moves has 1/6)
+    mask = jnp.zeros((1, 1800), dtype=jnp.bool_)
+    a30_1 = _encode_action(30, 40)
+    a30_2 = _encode_action(30, 50)
+    a30_3 = _encode_action(30, 60)
+    a31_1 = _encode_action(31, 41)
+    mask = mask.at[0, jnp.array([a30_1, a30_2, a30_3, a31_1])].set(True)
+    w_mag = get_weighted_uniform_policy(mask)
+    assert jnp.isclose(w_mag[0, a31_1], 0.5)
+    assert jnp.isclose(w_mag[0, a30_1], 1.0 / 6.0)
+
+    # Power schedule bounds
+    lr0 = power_schedule(0.5, jnp.int32(0), 1.1, 1e-4, 5e-6)
+    assert jnp.isclose(lr0, 1e-4)

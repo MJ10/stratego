@@ -54,14 +54,14 @@ def evaluate_vs_random(
         return final_s.reward_pl0 * sign
 
     # Half 1: Agent is Player 0, Random is Player 1
-    agent_arr0, _, _, _ = sample_arrangements(arr_model, k_arr0, half)
+    agent_arr0, _, _, _, _ = sample_arrangements(arr_model, k_arr0, half)
     env_s0 = jax.vmap(lambda k, a0: init_env(k, barrage=barrage, arr_pl0=a0, arr_pl1=None))(
         jax.random.split(k_env0, half), agent_arr0
     )
     ret0 = play_match(env_s0, 0, k_play0)
 
     # Half 2: Random is Player 0, Agent is Player 1
-    agent_arr1, _, _, _ = sample_arrangements(arr_model, k_arr1, half)
+    agent_arr1, _, _, _, _ = sample_arrangements(arr_model, k_arr1, half)
     env_s1 = jax.vmap(lambda k, a1: init_env(k, barrage=barrage, arr_pl0=None, arr_pl1=a1))(
         jax.random.split(k_env1, half), agent_arr1
     )
@@ -138,14 +138,14 @@ def evaluate_search_vs_policy(
         sign = 1.0 if search_player == 0 else -1.0
         return final_s.reward_pl0 * sign
 
-    arr0, _, _, _ = sample_arrangements(arr_model, k_arr0, half * 2)
+    arr0, _, _, _, _ = sample_arrangements(arr_model, k_arr0, half * 2)
     arr0_2 = arr0.reshape(half, 2, 40)
     env_s0 = jax.vmap(lambda k, a0, a1: init_env(k, barrage=barrage, arr_pl0=a0, arr_pl1=a1))(
         jax.random.split(k_env0, half), arr0_2[:, 0], arr0_2[:, 1]
     )
     ret0 = play_match(env_s0, 0, k_play0)
 
-    arr1, _, _, _ = sample_arrangements(arr_model, k_arr1, half * 2)
+    arr1, _, _, _, _ = sample_arrangements(arr_model, k_arr1, half * 2)
     arr1_2 = arr1.reshape(half, 2, 40)
     env_s1 = jax.vmap(lambda k, a0, a1: init_env(k, barrage=barrage, arr_pl0=a0, arr_pl1=a1))(
         jax.random.split(k_env1, half), arr1_2[:, 0], arr1_2[:, 1]
@@ -174,6 +174,8 @@ def main():
     parser.add_argument("--d_model", type=int, default=64)
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--bfloat16", action="store_true", help="Use bfloat16 Transformer compute")
+    parser.add_argument("--power_schedule", action="store_true", help="Use paper power-law LR and temperature schedules")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -184,6 +186,8 @@ def main():
         d_model=args.d_model,
         depth=args.depth,
         lr=args.lr,
+        use_bfloat16=args.bfloat16,
+        use_power_schedule=args.power_schedule,
     )
     print(
         f"Devices: {jax.devices()} | Variant: {'Barrage' if cfg.barrage else 'Classic'} | "
@@ -222,7 +226,7 @@ def main():
             )
         if it % args.eval_every == 0 or it == args.iterations:
             k_eval, subk = jax.random.split(k_eval)
-            ev = evaluate_vs_random(ts.move_model, ts.arr_model, subk, barrage=cfg.barrage)
+            ev = evaluate_vs_random(ts.ema_move_model, ts.ema_arr_model, subk, barrage=cfg.barrage)
             print(
                 f"[Eval {it:03d}] vs_random: return={float(ev['eval/return']):+.3f} "
                 f"(win={float(ev['eval/win_rate']):.1%}, tie={float(ev['eval/tie_rate']):.1%}, "
@@ -233,7 +237,7 @@ def main():
     # Final head-to-head evaluation: SearchBot (with learned BeliefTransformer) vs raw Policy Network
     t0 = time.perf_counter()
     s_ev = evaluate_search_vs_policy(
-        ts.move_model, ts.belief_model, ts.arr_model, k_search, barrage=cfg.barrage
+        ts.ema_move_model, ts.belief_model, ts.ema_arr_model, k_search, barrage=cfg.barrage
     )
     jax.block_until_ready(s_ev["search_vs_pol/return"])
     dt = time.perf_counter() - t0

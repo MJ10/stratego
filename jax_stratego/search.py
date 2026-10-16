@@ -22,6 +22,7 @@ from jax_stratego.networks import (
     N_VF_CAT,
     sample_belief,
 )
+from jax_stratego.train import get_weighted_uniform_policy
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class SearchConfig:
     max_num_Moves: int = 400
     max_moves_between_attacks: int = 80
     max_unknown: int = 8
+    uniform_magnet: bool = False
 
 
 def allocate_rollout_actions(mask: jax.Array, num_rollout_envs: int) -> jax.Array:
@@ -56,9 +58,18 @@ def compute_search_policy(
     legal_mask: jax.Array,        # (1800,) bool
     temperature: float,
     stepsize: float,
+    uniform_magnet: bool = False,
 ) -> jax.Array:
     """Closed-form KL/magnet-regularized mirror descent policy update (`pyengine/core/search.py`)."""
-    search_logits = (bp_log_probs + stepsize * q_estimates) / (1.0 + temperature * stepsize)
+    temp_ss = temperature * stepsize
+    if uniform_magnet:
+        search_logits = (bp_log_probs + stepsize * q_estimates) / (1.0 + temp_ss)
+    else:
+        magnet = get_weighted_uniform_policy(legal_mask[None, :])[0]
+        log_magnet = jnp.log(jnp.maximum(magnet, 1e-10))
+        search_logits = (bp_log_probs + stepsize * q_estimates + temp_ss * log_magnet) / (
+            1.0 + temp_ss
+        )
     masked_logits = jnp.where(legal_mask, search_logits, -1e9)
     return jax.nn.softmax(masked_logits, axis=-1)
 
@@ -193,7 +204,7 @@ def search_action(
     bp_log_probs = bp_log_probs[0]
 
     search_policy = compute_search_policy(
-        q_estimates, bp_log_probs, mask, cfg.temperature, cfg.stepsize
+        q_estimates, bp_log_probs, mask, cfg.temperature, cfg.stepsize, cfg.uniform_magnet
     )
     action = jax.random.categorical(k_act, jnp.log(jnp.maximum(search_policy, 1e-12)))
     return action, search_policy, q_estimates

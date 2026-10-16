@@ -28,7 +28,7 @@ class TransformerConfig:
     depth: int = 3
     ff_factor: int = 4
     use_cat_vf: bool = True
-
+    use_bfloat16: bool = False
 
 class SelfAttentionBlock(nnx.Module):
     def __init__(self, d_model: int, n_head: int, ff_factor: int, *, rngs: nnx.Rngs):
@@ -41,15 +41,17 @@ class SelfAttentionBlock(nnx.Module):
         self.ff2 = nnx.Linear(ff_factor * d_model, d_model, rngs=rngs)
 
     def __call__(self, x: jax.Array, is_causal: bool = False) -> jax.Array:
-        h = self.ln1(x)
+        orig_dtype = x.dtype
+        h = self.ln1(x.astype(jnp.float32)).astype(orig_dtype)
         B, T, D = h.shape
         head_dim = D // self.n_head
-        qkv = self.qkv(h).reshape(B, T, 3, self.n_head, head_dim)
+        qkv = self.qkv(h.astype(jnp.float32)).astype(orig_dtype).reshape(B, T, 3, self.n_head, head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
         attn = jax.nn.dot_product_attention(q, k, v, is_causal=is_causal)
-        x = x + self.out_proj(attn.reshape(B, T, D))
-        x = x + self.ff2(jax.nn.relu(self.ff1(self.ln2(x))))
-        return x
+        x = x + self.out_proj(attn.reshape(B, T, D).astype(jnp.float32)).astype(orig_dtype)
+        h2 = self.ln2(x.astype(jnp.float32)).astype(orig_dtype)
+        ff = self.ff2(jax.nn.relu(self.ff1(h2.astype(jnp.float32)))).astype(orig_dtype)
+        return x + ff
 
 
 class CrossAttentionBlock(nnx.Module):
@@ -111,18 +113,18 @@ class MoveTransformer(nnx.Module):
             value_out: (B, 3) log-probs if use_cat_vf else (B,) scalar
         """
         B = infostate.shape[0]
-        x = self.embedder(infostate)
-        # Prepend 1 special value token
-        val_tok = jnp.zeros((B, 1, self.cfg.d_model), dtype=x.dtype)
-        x = jnp.concatenate([val_tok, x], axis=1) + self.pos_emb[...]
+        compute_dtype = jnp.bfloat16 if self.cfg.use_bfloat16 else jnp.float32
+        x = self.embedder(infostate).astype(compute_dtype)
+        val_tok = jnp.zeros((B, 1, self.cfg.d_model), dtype=compute_dtype)
+        x = jnp.concatenate([val_tok, x], axis=1) + self.pos_emb[...].astype(compute_dtype)
         for block in self.blocks:
             x = block(x, is_causal=False)
-        out = self.norm_out(x)
+        out = self.norm_out(x.astype(jnp.float32))
 
         cell_emb = out[:, 1:, :]  # (B, 92, D)
         q = self.q_proj(cell_emb)
         k = self.k_proj(cell_emb)
-        pair_scores = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / math.sqrt(self.cfg.d_model)  # (B, 92, 92)
+        pair_scores = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / math.sqrt(self.cfg.d_model)
         flat_scores = pair_scores.reshape(B, N_OCCUPIABLE_CELL * N_OCCUPIABLE_CELL)
 
         # Map (src_occ, dst_occ) -> 1800 actions (matches LogitConverter)
@@ -160,7 +162,7 @@ class ArrangementTransformer(nnx.Module):
         self.norm_out = nnx.LayerNorm(cfg.d_model, rngs=rngs)
         self.policy_out = nnx.Linear(cfg.d_model, N_PIECE_TYPE, rngs=rngs)
         self.value_out = nnx.Linear(cfg.d_model, N_VF_CAT if cfg.use_cat_vf else 1, rngs=rngs)
-
+        self.ent_out = nnx.Linear(cfg.d_model, 1, rngs=rngs)
     def _legal_mask(self, seq_onehot: jax.Array) -> jax.Array:
         """Compute legal piece-type mask (B, 40, 14) from shifted prefix seq_onehot (B, 40, 14)."""
         cum_counts = jnp.cumsum(seq_onehot.astype(jnp.int32), axis=1)
@@ -172,16 +174,25 @@ class ArrangementTransformer(nnx.Module):
         legal = legal.at[:, :, FLAG].set(legal[:, :, FLAG] & flag_allowed)
         return legal
 
-    def __call__(self, arrangements_onehot: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Teacher-forced forward pass on arrangements_onehot: (B, 40, 14)."""
+    def __call__(
+        self, arrangements_onehot: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Teacher-forced forward pass on arrangements_onehot: (B, 40, 14).
+
+        Returns:
+            log_probs: (B, 40, 14)
+            value: (B, 40, 3) log-probs if use_cat_vf else (B, 40)
+            ent_pred: (B, 40) normalized future accumulated entropy prediction
+        """
         B = arrangements_onehot.shape[0]
+        compute_dtype = jnp.bfloat16 if self.cfg.use_bfloat16 else jnp.float32
         start_tok = jnp.zeros((B, 1, N_PIECE_TYPE), dtype=arrangements_onehot.dtype)
         seq = jnp.concatenate([start_tok, arrangements_onehot[:, :-1, :]], axis=1)
 
-        x = self.embedder(seq) + self.pos_emb[...]
+        x = self.embedder(seq).astype(compute_dtype) + self.pos_emb[...].astype(compute_dtype)
         for block in self.blocks:
             x = block(x, is_causal=True)
-        x = self.norm_out(x)
+        x = self.norm_out(x.astype(jnp.float32))
 
         logits = self.policy_out(x)
         legal_mask = self._legal_mask(seq)
@@ -193,12 +204,13 @@ class ArrangementTransformer(nnx.Module):
             v = jax.nn.log_softmax(v, axis=-1)
         else:
             v = jnp.squeeze(v, axis=-1)
-        return log_probs, v
+        ent_pred = jnp.squeeze(self.ent_out(x), axis=-1)
+        return log_probs, v, ent_pred
 
 
 def sample_arrangements(
     model: ArrangementTransformer, key: jax.Array, n_sample: int, randomize_flip: bool = True
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Autoregressively sample `n_sample` valid arrangements using `jax.lax.scan`.
 
     Returns:
@@ -206,6 +218,7 @@ def sample_arrangements(
         canonical_onehot: float32[n_sample, 40, 14] (before horizontal flip, for PPO training)
         log_probs: float32[n_sample, 40, 14]
         values: float32[n_sample, 40, 3]
+        ent_preds: float32[n_sample, 40]
     """
     init_samples = jnp.zeros((n_sample, ARRANGEMENT_SIZE, N_PIECE_TYPE), dtype=jnp.float32)
     step_keys = jax.random.split(key, ARRANGEMENT_SIZE + 1)
@@ -215,19 +228,21 @@ def sample_arrangements(
     def scan_step(samples, idx_and_key):
         t, k = idx_and_key
         m = nnx.merge(graphdef, state)
-        log_pi, v = m(samples)
+        log_pi, v, ent_p = m(samples)
         log_pi_t = log_pi[:, t, :]
         v_t = v[:, t]
+        ent_t = ent_p[:, t]
         sampled_piece = jax.random.categorical(k, log_pi_t, axis=-1)
         onehot_t = jax.nn.one_hot(sampled_piece, N_PIECE_TYPE, dtype=jnp.float32)
         samples = samples.at[:, t, :].set(onehot_t)
-        return samples, (log_pi_t, v_t)
+        return samples, (log_pi_t, v_t, ent_t)
 
-    canonical_onehot, (log_probs_T, values_T) = jax.lax.scan(
+    canonical_onehot, (log_probs_T, values_T, ent_T) = jax.lax.scan(
         scan_step, init_samples, (jnp.arange(ARRANGEMENT_SIZE), step_keys)
     )
     log_probs = jnp.swapaxes(log_probs_T, 0, 1)  # (B, 40, 14)
     values = jnp.swapaxes(values_T, 0, 1)        # (B, 40, 3)
+    ent_preds = jnp.swapaxes(ent_T, 0, 1)        # (B, 40)
 
     arr_ids = jnp.argmax(canonical_onehot, axis=-1).astype(jnp.int8)  # (B, 40)
     if randomize_flip:
@@ -235,7 +250,7 @@ def sample_arrangements(
         flipped_ids = jnp.flip(arr_ids.reshape(n_sample, 4, 10), axis=-1).reshape(n_sample, 40)
         arr_ids = jnp.where(do_flip[:, None], flipped_ids, arr_ids)
 
-    return arr_ids, canonical_onehot, log_probs, values
+    return arr_ids, canonical_onehot, log_probs, values, ent_preds
 
 
 def create_belief_mask(

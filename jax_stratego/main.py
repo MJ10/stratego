@@ -179,10 +179,14 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    max_moves = 400 if not args.classic else 1000
+    max_moves_attack = 80 if not args.classic else 150
     cfg = TrainConfig(
         barrage=not args.classic,
         num_envs=args.num_envs,
         rollout_steps=args.rollout_steps,
+        max_num_moves=max_moves,
+        max_moves_between_attacks=max_moves_attack,
         d_model=args.d_model,
         depth=args.depth,
         lr=args.lr,
@@ -201,7 +205,10 @@ def main():
 
     # Initial baseline evaluation (Iter 0)
     k_eval, subk = jax.random.split(k_eval)
-    eval0 = evaluate_vs_random(ts.move_model, ts.arr_model, subk, barrage=cfg.barrage)
+    eval0 = evaluate_vs_random(
+        ts.move_model, ts.arr_model, subk, barrage=cfg.barrage,
+        max_moves=max_moves, max_moves_between_attacks=max_moves_attack,
+    )
     print(
         f"[Eval 000] vs_random: return={float(eval0['eval/return']):+.3f} "
         f"(win={float(eval0['eval/win_rate']):.1%}, tie={float(eval0['eval/tie_rate']):.1%}, "
@@ -226,7 +233,10 @@ def main():
             )
         if it % args.eval_every == 0 or it == args.iterations:
             k_eval, subk = jax.random.split(k_eval)
-            ev = evaluate_vs_random(ts.ema_move_model, ts.ema_arr_model, subk, barrage=cfg.barrage)
+            ev = evaluate_vs_random(
+                ts.ema_move_model, ts.ema_arr_model, subk, barrage=cfg.barrage,
+                max_moves=max_moves, max_moves_between_attacks=max_moves_attack,
+            )
             print(
                 f"[Eval {it:03d}] vs_random: return={float(ev['eval/return']):+.3f} "
                 f"(win={float(ev['eval/win_rate']):.1%}, tie={float(ev['eval/tie_rate']):.1%}, "
@@ -237,7 +247,8 @@ def main():
     # Final head-to-head evaluation: SearchBot (with learned BeliefTransformer) vs raw Policy Network
     t0 = time.perf_counter()
     s_ev = evaluate_search_vs_policy(
-        ts.ema_move_model, ts.belief_model, ts.ema_arr_model, k_search, barrage=cfg.barrage
+        ts.ema_move_model, ts.belief_model, ts.ema_arr_model, k_search,
+        barrage=cfg.barrage, max_moves=max_moves, max_moves_between_attacks=max_moves_attack,
     )
     jax.block_until_ready(s_ev["search_vs_pol/return"])
     dt = time.perf_counter() - t0
